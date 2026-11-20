@@ -12,12 +12,29 @@ logit so a noisy fit never predicts a big drop below the last read.
 Spread: honest logit sigma from fit residual + horizon growth + category
 uncertainty (missable / platinum / gold / collectibles get extra width);
 low-count, jumpy trophies get wide bands, settled ones narrow bands.
+A fit on fewer than 6 points gets extra widening (+0.15 logit per
+missing point): a 3-parameter curve is nearly exact on 3-5 points by
+construction, so its residual understates the real uncertainty.
 
 Flat-history branch: when every read in the case is identical (the page
 had not refreshed yet, e.g. the practice cases), the observed rates are
 stale pre-refresh values. Exophase refreshes dilute rates as the tracked
-player base jumps, so the median is shifted down 0.5 logit and the band
-widened (sigma 0.85) instead of trusting the stale plateau.
+player base jumps, so the median is shifted down 1.0 logit and the band
+widened (sigma 1.0) instead of trusting the stale plateau. Why 1.0: the
+documented launch-night refresh grew the base 638 -> 3868 players (~6x),
+and the house's own persistence practice loss (1.51) sits near the
+frozen-earner end of that dilution, i.e. new players had earned almost
+nothing yet; -0.5 would assume they earn at half the old rate. A
+simulation over refresh depths (new players earning 0%/10%/25%/50% of
+the old rate) puts -1.0/sigma 1.0 ahead of -0.5/sigma 0.85 under every
+depth (worst case 0.42 vs 0.72 pinball loss).
+
+Refresh-regime split: a read where players_tracked jumps >25% marks an
+Exophase refresh — the tracked base jumps and every rate dilutes at once.
+The saturating fit runs on the segment after the last refresh when that
+segment has 3+ distinct times; otherwise it falls back to the whole
+history. Pre-refresh reads describe a smaller population, and fitting
+across the dilution drop would bias the curve and inflate residuals.
 
 Deterministic: pure arithmetic, no randomness, no clock, no network.
 Reads every <id>.in in the input dir (name order), writes <id>.out.
@@ -181,17 +198,29 @@ def fit_saturation(ts, ys, ws, a_lo, a_hi):
     return a, B, k, resid
 
 
-def forecast_trophy(idx, trophy, history, horizon_minutes, target_dt):
-    """Return the 5 quantiles (percent) for one trophy."""
-    group, lo_pct, hi_pct = PRIORS.get(trophy["id"], DEFAULT_PRIOR)
-    a_lo, a_hi = logit(lo_pct), logit(hi_pct)
-    extra_spread = GROUP_SPREAD.get(group, 0.0)
-    horizon_days = horizon_minutes / 1440.0
-    t_target = hours_since_release(target_dt)
+def _last_refresh_index(history):
+    """Index of the first read after the last Exophase refresh, or 0.
 
-    # Collect (t, logit rate) points, collapsing consecutive duplicate rates
-    # (a stale page repeats the same value; keep the last time of each run).
-    pts = []  # (t, y, weight)
+    A refresh is a read where players_tracked jumps >25% over the
+    previous read: Exophase re-pulls the page, the tracked base jumps,
+    and every rate dilutes at once. Reads before a refresh describe a
+    different, smaller population.
+    """
+    idx = 0
+    prev = None
+    for i, read in enumerate(history):
+        players = read.get("players_tracked") or 0
+        if prev and players > prev * 1.25:
+            idx = i
+        prev = players
+    return idx
+
+
+def _collect_points(history, idx):
+    """Collect (t, logit rate, weight) points, collapsing consecutive
+    duplicate rates (a stale page repeats the same value; keep the last
+    time of each run)."""
+    pts = []
     last_y = None
     for read in history:
         rate = read["rates"][idx]
@@ -207,6 +236,25 @@ def forecast_trophy(idx, trophy, history, horizon_minutes, target_dt):
             continue
         pts.append((t, y, w))
         last_y = y
+    return pts
+
+
+def forecast_trophy(idx, trophy, history, horizon_minutes, target_dt):
+    """Return the 5 quantiles (percent) for one trophy."""
+    group, lo_pct, hi_pct = PRIORS.get(trophy["id"], DEFAULT_PRIOR)
+    a_lo, a_hi = logit(lo_pct), logit(hi_pct)
+    extra_spread = GROUP_SPREAD.get(group, 0.0)
+    horizon_days = horizon_minutes / 1440.0
+    t_target = hours_since_release(target_dt)
+
+    # Refresh regime: fit on the segment after the last refresh when it
+    # has enough movement to fit; pre-refresh reads describe a smaller
+    # population, and the dilution drop at the refresh would otherwise
+    # bias the saturating fit and inflate its residual.
+    seg_start = _last_refresh_index(history)
+    pts = _collect_points(history[seg_start:], idx)
+    if len({round(p[0], 6) for p in pts}) < 3 and seg_start > 0:
+        pts = _collect_points(history, idx)
 
     if not pts:
         # No data at all: flat 0.01% with a wide band.
@@ -221,8 +269,8 @@ def forecast_trophy(idx, trophy, history, horizon_minutes, target_dt):
     if all_flat or distinct_t < 3:
         # No movement to fit: stale pre-refresh plateau. Persistence median
         # shifted down for refresh dilution, with a wide band.
-        med = last_logit - 0.5
-        return quantiles(med, 0.85)
+        med = last_logit - 1.0
+        return quantiles(med, 1.0)
 
     ts = [p[0] for p in pts]
     ys = [p[1] for p in pts]
@@ -243,6 +291,12 @@ def forecast_trophy(idx, trophy, history, horizon_minutes, target_dt):
         + (0.22 * math.sqrt(horizon_days)) ** 2
         + extra_spread ** 2
     )
+    # Few points -> the 3-parameter saturating fit is nearly exact by
+    # construction (3 free parameters on 3-5 points), so its residual
+    # understates the real uncertainty. Widen the band for short
+    # post-refresh segments; a long history earns the narrow band.
+    if len(pts) < 6:
+        s += 0.15 * (6 - len(pts))
     s = min(2.0, max(0.20, s))
     return quantiles(med, s)
 
